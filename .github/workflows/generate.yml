@@ -1,7 +1,5 @@
 name: generate hosts file
 on:
-  schedule:
-    - cron: '0 * * * *'
   push:
     branches:
       - master
