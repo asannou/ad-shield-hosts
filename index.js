@@ -2,6 +2,7 @@ import { Deobfuscator } from 'deobfuscator';
 import * as acorn from 'acorn';
 import estraverse from 'estraverse';
 
+// Suppress logs from the deobfuscator library
 console.log = () => {};
 
 const url = 'https://cdn.jsdelivr.net/gh/ad-shield/e/index.js';
@@ -16,131 +17,46 @@ const opts = {
 };
 
 const node = acorn.parse(text, opts);
-const deobfuscator = new Deobfuscator()
+const deobfuscator = new Deobfuscator();
 const ast = await deobfuscator.deobfuscateNode(node, opts);
 console.log(ast);
 
-const scripts = [];
+const domains = new Set();
 
 estraverse.traverse(ast, {
-  enter(node, parent) {
-    if (
-      node.type === "CallExpression" &&
-      node.callee.type === "MemberExpression" &&
-      node.callee.object.type === "Identifier" &&
-      node.callee.object.name === "document" &&
-      node.callee.property.type === "Identifier" &&
-      node.callee.property.name === "createElement" &&
-      node.arguments.length === 1 &&
-      node.arguments[0].type === "Literal" &&
-      node.arguments[0].value === "script"
-    ) {
-      if (
-        parent.type === "VariableDeclarator" &&
-        parent.id.type === "Identifier"
-      ) {
-        const varName = parent.id.name;
+  enter(node) {
+    if (node.type === 'ArrayExpression' && node.elements.length > 0) {
+      const isStringArray = node.elements.every(e => e && e.type === "Literal" && typeof e.value === "string");
 
-        estraverse.traverse(ast, {
-          enter(n, p) {
-            if (
-              n.type === "AssignmentExpression" &&
-              n.left.type === "MemberExpression" &&
-              n.left.object.type === "Identifier" &&
-              n.left.object.name === varName &&
-              n.left.property.type === "Identifier" &&
-              n.left.property.name === "src"
-            ) {
-              const idName = findIdentifierInBinary(n.right);
-              if (!idName) return;
+      if (isStringArray) {
+        // Heuristic: Identify arrays containing domain-like strings
+        const hasDomain = node.elements.some(e => e.value.includes('.') && !e.value.includes(' ') && e.value.length > 3);
 
-              const decl = findArrayPatternDecl(ast, idName);
-              if (!decl) return;
-
-              const sourceIdent = decl.init.name;
-              const arr = findConditionalArray(ast, sourceIdent);
-              if (arr) {
-                scripts.push(arr);
-              }
-            }
-          }
-        });
+        if (hasDomain) {
+           node.elements.forEach(e => {
+            try {
+               let val = e.value;
+               if (val.startsWith('http')) {
+                   val = new URL(val).hostname;
+               }
+               if (val.includes('.') && !val.includes(' ')) {
+                   domains.add(val);
+               }
+            } catch(err) {}
+           });
+        }
       }
     }
   }
 });
 
-const nodes = [];
-nodes.push(...scripts[0].trueBranch);
-nodes.push(...scripts[0].falseBranch);
+const sortedDomains = Array.from(domains).sort();
 
-for (const node of nodes) {
-  const url = new URL(node);
-  process.stdout.write(`0.0.0.0 ${url.hostname}\n`);
+if (sortedDomains.length === 0) {
+  process.stderr.write("Error: No domains found.\n");
+  process.exit(1);
 }
 
-function findIdentifierInBinary(node) {
-  if (node.type === "BinaryExpression") {
-    if (node.left.type === "Identifier") return node.left.name;
-    const l = findIdentifierInBinary(node.left);
-    if (l) return l;
-    return findIdentifierInBinary(node.right);
-  }
-  return null;
+for (const domain of sortedDomains) {
+  process.stdout.write(`0.0.0.0 ${domain}\n`);
 }
-
-function findArrayPatternDecl(ast, name) {
-  let found = null;
-  estraverse.traverse(ast, {
-    enter(n) {
-      if (
-        n.type === "VariableDeclarator" &&
-        n.id.type === "ArrayPattern" &&
-        n.id.elements.length > 0 &&
-        n.id.elements[0].type === "Identifier" &&
-        n.id.elements[0].name === name &&
-        n.init.type === "Identifier"
-      ) {
-        found = n;
-        this.break();
-      }
-    }
-  });
-  return found;
-}
-
-function findConditionalArray(ast, identName) {
-  let res = null;
-  estraverse.traverse(ast, {
-    enter(n) {
-      if (
-        n.type === "CallExpression" &&
-        n.arguments.length === 1
-      ) {
-        const arg = n.arguments[0];
-        if (
-          arg.type === "ConditionalExpression" &&
-          (  (arg.consequent.type === "ArrayExpression") ||
-             (arg.alternate.type === "ArrayExpression")
-          )
-        ) {
-          res = {
-            trueBranch:  (arg.consequent.type === "ArrayExpression")
-                          ? literalArray(arg.consequent) : null,
-            falseBranch: (arg.alternate.type  === "ArrayExpression")
-                          ? literalArray(arg.alternate) : null
-          };
-          this.break();
-        }
-      }
-    }
-  });
-  return res;
-}
-
-function literalArray(arrNode) {
-  return arrNode.elements
-    .filter(e => e.type === "Literal")
-    .map(e => e.value);
-}
-
